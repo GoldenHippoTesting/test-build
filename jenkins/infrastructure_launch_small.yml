@@ -1,0 +1,169 @@
+---
+- job:
+    name: 1_infrastructure_launch_small
+    description: Launch autoscaling infrastructure required for Golden Hippo static sites and smaller deployments.
+    parameters:
+      - string:
+          name: Domain
+          default:
+          description: The apex domain you would like to use for DNS and HTTPS connectivity
+      - string:
+          name: StackName
+          default:
+          description: Name of the Cloudformation stack
+      - string:
+          name: Region
+          default: us-west-1
+          description: Region where resources will be deployed to
+      - string:
+          name: TargetVPC
+          default: vpc-0ebc9f6b
+          description: VPC where resources will be deployed to
+      - string:
+          name: TargetPublicSubnets
+          default: subnet-b7a28cee,subnet-4d28cb29
+          description: Public subnets where load balancers will reside
+      - string:
+          name: TargetPrivateSubnets
+          default: subnet-b7a28cee,subnet-4d28cb29
+          description: Private subnets where web servers will reside
+      - string:
+          name: WebInstanceType
+          default: t2.small
+          description: EC2 instance type to use for autoscaling
+      - string:
+          name: FriendlyName
+          default:
+          description: Name to use for tagging resources (no spaces, dashes, or symbols)
+      - string:
+          name: KeyPairName
+          default: jenkins
+          description: SSH Key pair to use for provisioning instances
+      - string:
+          name: AutoScalingMaximum
+          default: "1"
+          description: Maximum number of instances to scale to
+      - string:
+          name: AutoScalingMinimum
+          default: "1"
+          description: Minimum number of instances in autoscaling group
+    scm:
+      - git:
+         url: git@github.com:reliam/gh-build.git
+         credentials-id: 2408a9f7-01fc-4dde-b6d3-fe8a5dd24783
+         branches:
+          - origin/master
+    builders:
+      - shell: |
+          #!/bin/bash
+
+          set -e
+
+          # Packer
+          echo -e "\n\n[+] Executing packer build for domain $Domain\n\n"
+          sleep 3
+          /bin/packer --version
+          /bin/packer validate -syntax-only -var-file=build/env_west-1.json -var "domain_name=$Domain" build/gh-prod-web.json
+          /bin/packer build -var-file=build/env_west-1.json -var "domain_name=$Domain" -machine-readable build/gh-prod-web.json | tee /tmp/packer_build.log
+          AMI=$(tail /tmp/packer_build.log | egrep -m1 -oe "ami-.{8}")
+          echo -e "[+] Got AMI $AMI"
+          sleep 3
+
+          # Cloudformation
+          echo -e "\n\n[+] Executing Cloudformation deployment for $Domain"
+          sleep 3
+          aws cloudformation deploy \
+              --template-file cloudformation/golden-hippo-static.yml \
+              --stack-name $StackName \
+              --parameter-overrides \
+              TargetVPC="$TargetVPC" \
+              TargetPublicSubnets="$TargetPublicSubnets" \
+              TargetPrivateSubnets="$TargetPrivateSubnets" \
+              WebInstanceType="$WebInstanceType" \
+              FriendlyName="$FriendlyName" \
+              KeyPairName="$KeyPairName" \
+              ImageID="$AMI" \
+              AutoScalingMinimum="$AutoScalingMinimum" \
+              AutoScalingMaximum="$AutoScalingMaximum" \
+              --capabilities CAPABILITY_NAMED_IAM \
+              --region $Region
+
+
+          # Grab stack outputs
+          CodeDeployApplication=$(aws cloudformation describe-stacks \
+              --region $Region \
+              --stack-name $StackName \
+              --query 'Stacks[0].Outputs[?OutputKey==`CodeDeployApplication`].OutputValue' \
+              --output text)
+
+          CodeDeployGroup=$(aws cloudformation describe-stacks \
+              --region $Region \
+              --stack-name $StackName \
+              --query 'Stacks[0].Outputs[?OutputKey==`CodeDeployGroup`].OutputValue' \
+              --output text)
+
+          DeployBucket=$(aws cloudformation describe-stacks \
+              --region $Region \
+              --stack-name $StackName \
+              --query 'Stacks[0].Outputs[?OutputKey==`DeployBucket`].OutputValue' \
+              --output text)
+
+          # Output all information and application files
+          echo -e "\n\n\n[+] Your infrastructure has finished deploying! This includes autoscaling infrastructure for smaller static sites. The Cloudformation Stack Name is '${StackName}', so all resources will match this as their tag name prefix."
+          sleep 5
+
+          echo -e "\n\nPLEASE ADD THESE DYNAMICALLY GENERATED FILES TO YOUR APPLICATION REPO\n\n\n"
+          sleep 2
+
+          echo -e "FILE 1\nappspec.yml - the file that controls CodeDeploy agents on the web servers and where to deploy files to on the filesystem"
+          cat << OFP
+          EOF
+          version: 0.0
+          os: linux
+          files:
+            - source: ./
+              destination: /var/www/vhosts/$Domain/
+          hooks:
+             AfterInstall:
+               - location: post_install.sh
+                 timeout: 15
+          EOF
+          OFP
+
+          echo -e "\n\n\nFILE 2\npost_install.sh - the post-deployment shell script that CodeDeploy agents execute to clean up or flush cache type actions"
+          cat << OFP
+          EOF
+          #!/bin/bash
+          chown -R nginx:nginx /var/www/vhosts/*
+          # Other custom actions in this below
+          EOF
+          OFP
+
+          echo -e "\n\n\nFILE 3\nJenkinsfile - the file that controls Jenkins, and will automatically populate deployment jobs within the Github organization"
+          cat << OFP
+          EOF
+          pipeline {
+            agent any
+            options {
+              disableConcurrentBuilds()
+            }
+            triggers {
+                pollSCM('* * * * *')
+            }
+            stages {
+              stage('deploy') {
+                when {
+                  branch 'master'
+                }
+                steps {
+                  checkout scm
+                  sh "aws deploy push --application-name $CodeDeployApplication --s3-location s3://$DeployBucket/app.zip --source ./ --region $Region"
+                  sh "aws deploy create-deployment --application-name $CodeDeployApplication --s3-location bucket=$DeployBucket,key=app.zip,bundleType=zip --deployment-group-name $CodeDeployGroup --description \"Deployed $CodeDeployApplication from Jenkins job \$JOB_NAME build #\$BUILD_NUMBER, by \$GIT_COMMITTER_EMAIL.\" --region $Region"
+                }
+              }
+            }
+          }
+          EOF
+          OFP
+
+          echo -e "\n\n\nOnce you have put those files into your application repo run an organization scan in Jenkins for the job to populate. Deployments should happen immediately."
